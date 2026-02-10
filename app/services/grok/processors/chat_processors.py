@@ -311,6 +311,38 @@ class CollectProcessor(BaseProcessor):
         self.image_format = get_config("app.image_format")
         self.filter_tags = get_config("chat.filter_tags")
 
+    def _extract_token(self, resp: dict) -> tuple[str | None, bool | None]:
+        """提取 token 文本与是否为思维链内容的标记"""
+        token = resp.get("token")
+        is_reasoning = None
+        text = None
+
+        if isinstance(token, dict):
+            text = (
+                token.get("text")
+                or token.get("token")
+                or token.get("content")
+                or token.get("value")
+            )
+            if "isReasoning" in token:
+                is_reasoning = bool(token.get("isReasoning"))
+            elif "isThinking" in token:
+                is_reasoning = bool(token.get("isThinking"))
+        else:
+            text = token
+
+        if is_reasoning is None:
+            if "isReasoning" in resp:
+                is_reasoning = bool(resp.get("isReasoning"))
+            elif "isThinking" in resp:
+                is_reasoning = bool(resp.get("isThinking"))
+
+        if text is None:
+            return None, is_reasoning
+        if not isinstance(text, str):
+            text = str(text)
+        return text, is_reasoning
+
     def _filter_content(self, content: str) -> str:
         """过滤内容中的特殊标签"""
         if not content or not self.filter_tags:
@@ -329,6 +361,7 @@ class CollectProcessor(BaseProcessor):
         fingerprint = ""
         content = ""
         token_chunks: list[str] = []
+        reasoning_chunks: list[str] = []
         image_chunks: list[str] = []
         idle_timeout = get_config("timeout.stream_idle_timeout")
 
@@ -393,9 +426,12 @@ class CollectProcessor(BaseProcessor):
                         fingerprint = meta["llm_info"]["modelHash"]
                     continue
 
-                if (token := resp.get("token")) is not None:
-                    if token:
-                        token_chunks.append(token)
+                token_text, is_reasoning = self._extract_token(resp)
+                if token_text:
+                    if is_reasoning is True:
+                        reasoning_chunks.append(token_text)
+                    else:
+                        token_chunks.append(token_text)
 
         except asyncio.CancelledError:
             logger.debug("Collect cancelled by client", extra={"model": self.model})
@@ -419,7 +455,18 @@ class CollectProcessor(BaseProcessor):
         if token_chunks:
             content = "".join(token_chunks)
 
+        reasoning_content = ""
+        if reasoning_chunks:
+            reasoning_content = "".join(reasoning_chunks)
+        elif content:
+            match = re.search(r"<think>(.*?)</think>", content, flags=re.DOTALL)
+            if match:
+                reasoning_content = match.group(1)
+                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+
         content = self._filter_content(content)
+        if reasoning_content:
+            reasoning_content = self._filter_content(reasoning_content)
         if image_chunks:
             if content and not content.endswith("\n"):
                 content += "\n"
@@ -437,6 +484,7 @@ class CollectProcessor(BaseProcessor):
                     "message": {
                         "role": "assistant",
                         "content": content,
+                        "reasoning_content": reasoning_content or None,
                         "refusal": None,
                         "annotations": [],
                     },
