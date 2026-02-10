@@ -31,7 +31,9 @@ class StreamProcessor(BaseProcessor):
         self.response_id: str = None
         self.fingerprint: str = ""
         self.think_opened: bool = False
+        self.think_context: str | None = None
         self.role_sent: bool = False
+        self.has_answer_tokens: bool = False
         self.filter_tags = get_config("chat.filter_tags")
         self.image_format = get_config("app.image_format")
         self._tag_buffer: str = ""
@@ -41,6 +43,38 @@ class StreamProcessor(BaseProcessor):
             self.show_think = get_config("chat.thinking")
         else:
             self.show_think = think
+
+    def _extract_token(self, resp: dict) -> tuple[str | None, bool | None]:
+        """提取 token 文本与是否为思维链内容的标记"""
+        token = resp.get("token")
+        is_reasoning = None
+        text = None
+
+        if isinstance(token, dict):
+            text = (
+                token.get("text")
+                or token.get("token")
+                or token.get("content")
+                or token.get("value")
+            )
+            if "isReasoning" in token:
+                is_reasoning = bool(token.get("isReasoning"))
+            elif "isThinking" in token:
+                is_reasoning = bool(token.get("isThinking"))
+        else:
+            text = token
+
+        if is_reasoning is None:
+            if "isReasoning" in resp:
+                is_reasoning = bool(resp.get("isReasoning"))
+            elif "isThinking" in resp:
+                is_reasoning = bool(resp.get("isThinking"))
+
+        if text is None:
+            return None, is_reasoning
+        if not isinstance(text, str):
+            text = str(text)
+        return text, is_reasoning
 
     def _filter_token(self, token: str) -> str:
         """过滤 token 中的特殊标签（如 <grok:render>...</grok:render>），支持跨 token 的标签过滤"""
@@ -145,6 +179,7 @@ class StreamProcessor(BaseProcessor):
                         if not self.think_opened:
                             yield self._sse("<think>\n")
                             self.think_opened = True
+                            self.think_context = "progress"
                         idx = img.get("imageIndex", 0) + 1
                         progress = img.get("progress", 0)
                         yield self._sse(
@@ -154,11 +189,22 @@ class StreamProcessor(BaseProcessor):
 
                 # modelResponse
                 if mr := resp.get("modelResponse"):
+                    msg = mr.get("message")
                     if self.think_opened and self.show_think:
-                        if msg := mr.get("message"):
-                            yield self._sse(msg + "\n")
-                        yield self._sse("</think>\n")
-                        self.think_opened = False
+                        if self.think_context == "reasoning":
+                            yield self._sse("</think>\n")
+                            self.think_opened = False
+                            self.think_context = None
+                            if msg and not self.has_answer_tokens:
+                                yield self._sse(msg)
+                        else:
+                            if msg:
+                                yield self._sse(msg + "\n")
+                            yield self._sse("</think>\n")
+                            self.think_opened = False
+                            self.think_context = None
+                    elif msg and not self.has_answer_tokens:
+                        yield self._sse(msg)
 
                     # 处理生成的图片
                     for url in _collect_image_urls(mr):
@@ -195,11 +241,27 @@ class StreamProcessor(BaseProcessor):
                     continue
 
                 # 普通 token
-                if (token := resp.get("token")) is not None:
-                    if token:
-                        filtered = self._filter_token(token)
-                        if filtered:
-                            yield self._sse(filtered)
+                token_text, is_reasoning = self._extract_token(resp)
+                if token_text:
+                    filtered = self._filter_token(token_text)
+                    if not filtered:
+                        continue
+                    if self.show_think and is_reasoning is True:
+                        if not self.think_opened:
+                            yield self._sse("<think>\n")
+                            self.think_opened = True
+                            self.think_context = "reasoning"
+                        elif self.think_context != "reasoning":
+                            self.think_context = "reasoning"
+                        yield self._sse(filtered)
+                        continue
+
+                    if self.think_opened and self.show_think:
+                        yield self._sse("</think>\n")
+                        self.think_opened = False
+                        self.think_context = None
+                    self.has_answer_tokens = True
+                    yield self._sse(filtered)
 
             if self.think_opened:
                 yield self._sse("</think>\n")
