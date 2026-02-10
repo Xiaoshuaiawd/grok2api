@@ -1,7 +1,32 @@
 services:
+  warp:
+    image: caomingjun/warp
+    #container_name: warp
+    restart: always
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - WARP_SLEEP=5
+    cap_add:
+      - MKNOD
+      - AUDIT_WRITE
+      - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - ./warpdata:/var/lib/cloudflare-warp
+    networks:
+      - default  # 使用内部网络，不对外暴露端口
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-s", "https://www.google.com"]  # 静默模式下请求Google，>如果成功返回2xx状态码
+      interval: 30s  # 每隔30秒检查一次
+      timeout: 10s   # 请求超时10秒
+      retries: 3     # 失败3次后标记为不健康
+      start_period: 5s  # 容器启动后等待5秒再开始检查
   grok2api:
     container_name: grok2api
-    image: ghcr.io/chenyme/grok2api:latest
+    build: .
     ports:
       - "8000:8000"
     environment:
@@ -9,15 +34,51 @@ services:
       LOG_LEVEL: INFO
       SERVER_PORT: 8000
       SERVER_WORKERS: 1
-      SERVER_STORAGE_TYPE: local
-      # SERVER_STORAGE_URL: 
-
-      # SERVER_STORAGE_TYPE: (local, redis, mysql, pgsql) default: local
-      # SERVER_STORAGE_URL: (local mode is empty) default: empty
-      #   Redis: redis://localhost:6379/0 or redis://:password@localhost:6379/0
-      #   MySQL: mysql+aiomysql://user:pass@localhost/db
-      #   PgSQL: postgresql+asyncpg://user:pass@localhost/db
+      SERVER_STORAGE_TYPE: pgsql
+      SERVER_STORAGE_URL: postgresql+asyncpg://root:ZWS1998.@postgres/grok2api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      warp:
+        condition: service_healthy
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
     restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: grok2api-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=root
+      - POSTGRES_PASSWORD=ZWS1998.
+      - POSTGRES_DB=grok2api
+      # 高并发优化
+      - POSTGRES_MAX_CONNECTIONS=2000
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c effective_cache_size=768MB
+      -c work_mem=16MB
+      -c maintenance_work_mem=128MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+networks:
+  default:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16

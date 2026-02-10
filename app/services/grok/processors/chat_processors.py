@@ -266,6 +266,8 @@ class CollectProcessor(BaseProcessor):
         response_id = ""
         fingerprint = ""
         content = ""
+        token_chunks: list[str] = []
+        image_chunks: list[str] = []
         idle_timeout = get_config("timeout.stream_idle_timeout")
 
         try:
@@ -288,7 +290,6 @@ class CollectProcessor(BaseProcessor):
                     content = mr.get("message", "")
 
                     if urls := _collect_image_urls(mr):
-                        content += "\n"
                         for url in urls:
                             parts = url.split("/")
                             img_id = parts[-2] if len(parts) >= 2 else "image"
@@ -300,19 +301,27 @@ class CollectProcessor(BaseProcessor):
                                         url, self.token, "image"
                                     )
                                     if base64_data:
-                                        content += f"![{img_id}]({base64_data})\n"
+                                        image_chunks.append(
+                                            f"![{img_id}]({base64_data})\n"
+                                        )
                                     else:
                                         final_url = await self.process_url(url, "image")
-                                        content += f"![{img_id}]({final_url})\n"
+                                        image_chunks.append(
+                                            f"![{img_id}]({final_url})\n"
+                                        )
                                 except Exception as e:
                                     logger.warning(
                                         f"Failed to convert image to base64, falling back to URL: {e}"
                                     )
                                     final_url = await self.process_url(url, "image")
-                                    content += f"![{img_id}]({final_url})\n"
+                                    image_chunks.append(
+                                        f"![{img_id}]({final_url})\n"
+                                    )
                             else:
                                 final_url = await self.process_url(url, "image")
-                                content += f"![{img_id}]({final_url})\n"
+                                image_chunks.append(
+                                    f"![{img_id}]({final_url})\n"
+                                )
 
                     if (
                         (meta := mr.get("metadata", {}))
@@ -320,6 +329,11 @@ class CollectProcessor(BaseProcessor):
                         .get("modelHash")
                     ):
                         fingerprint = meta["llm_info"]["modelHash"]
+                    continue
+
+                if (token := resp.get("token")) is not None:
+                    if token:
+                        token_chunks.append(token)
 
         except asyncio.CancelledError:
             logger.debug("Collect cancelled by client", extra={"model": self.model})
@@ -340,7 +354,14 @@ class CollectProcessor(BaseProcessor):
         finally:
             await self.close()
 
+        if token_chunks:
+            content = "".join(token_chunks)
+
         content = self._filter_content(content)
+        if image_chunks:
+            if content and not content.endswith("\n"):
+                content += "\n"
+            content += "".join(image_chunks)
 
         return {
             "id": response_id,
